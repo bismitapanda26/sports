@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+03_gemma_summary_generator.py
+
+Generate teacher (reference) summaries for chunk files produced by
+02_json_chunk_extraction_03.py, using any OpenAI-compatible chat API
+(Gemma / Qwen / Gemini via LiteLLM, vLLM, Ollama ...).
+
+Key behaviour
+-------------
+* Deterministic labels (temperature 0 + seed) so runs are reproducible.
+* Thinking/reasoning text is NEVER used as a summary.
+* Failed chunks are written with status="error" and an EMPTY summary
+  (filter on status == "ok" before training).
+* Output length is capped and validated (sentences / words); bad outputs
+  are retried, and still-bad ones are marked status="invalid".
+* Results are appended to <movie>_output.jsonl after every chunk, so a
+  crash loses nothing; re-running resumes from where it stopped.
+* --context none|teacher controls the previous-summary conditioning.
+  'none' (default) avoids the train/inference mismatch: the student never
+  sees teacher summaries at inference time.
+
+Example
+-------
+python 03_gemma_summary_generator.py -i ./chunks -o ./summaries \
+    --model google/gemma-4-31B --api_url http://<server>:4000/v1/chat/completions
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import time
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --------------------------------------------------------------------------
+# API configuration (key handling unchanged: env var > fallback)
+# --------------------------------------------------------------------------
+DEFAULT_API_URL = "http://107.108.92.242:4000/v1/chat/completions"
+DEFAULT_MODEL = "google/gemma-4-31B"
+DEFAULT_FALLBACK_KEY = ""                 # <-- put your fallback key here
+API_KEY = os.getenv("GEMMA_API_KEY") or DEFAULT_FALLBACK_KEY
+
+# --------------------------------------------------------------------------
+# Generation parameters
+# --------------------------------------------------------------------------
+TEMPERATURE = 0.0
+SEED = 42
+MAX_TOKENS = 160          # 2-3 sentences; keeps labels inside the student's 200-token output cap
+REQUEST_TIMEOUT = 180     # seconds
+MAX_RETRIES = 4           # network / server errors
+MAX_FORMAT_RETRIES = 2    # outputs that fail validation
+
+MIN_SENTENCES, MAX_SENTENCES = 1, 3
+MAX_WORDS = 60
+
+PROMPT_VERSION = "v2"
+
+SYSTEM_PROMPT = """You are an expert movie summarizer. You summarize short segments of movie subtitle dialogue.
+
+Input format:
+- Text is subtitle dialogue from one segment of a movie.
+- "Name:" at the start of a sentence is a speaker label (e.g. "Woman:", "John:").
+- Tags in square brackets are sound cues, not dialogue: [music], [crying], [screaming], [laughter], [cheering], [gunshot], [explosion], [sirens].
+
+Rules:
+1. CONCISENESS: Output 2-3 sentences, at most 50 words in total, covering only the key plot points, events, or character actions.
+2. NAMES: Use a character's name ONLY if it is clearly stated in the dialogue or speaker labels. Otherwise use neutral descriptions (e.g. "a woman", "the man", "his friend").
+3. GROUNDING: Use only the provided dialogue. Do not use outside knowledge of the movie, do not guess the title, and do not invent events.
+4. STYLE: Third person, present tense, plain prose. No quotes from the dialogue, no bullet points, no markdown, no preface such as "Here is the summary".
+5. If the dialogue has little plot content, briefly describe what the characters are talking about."""
+
+CONTEXT_TEMPLATE = (
+    "Summary of the preceding segment (context ONLY, to resolve names/pronouns; "
+    "do NOT repeat it):\n{prev}\n\n"
+)
+USER_TEMPLATE = "{context}Dialogue:\n{text}\n\nSummary:"
+
+PREFACE_RE = re.compile(
+    r"^\s*(?:here(?:'s| is) (?:a |the )?(?:concise )?summary[^:\n]*:|summary\s*:|in this (?:segment|scene)[,:]?\s*(?=\w))\s*",
+    re.IGNORECASE,
+)
+
+
+# --------------------------------------------------------------------------
+# API call
+# --------------------------------------------------------------------------
+class RetryableError(Exception):
+    pass
+
+
+_UNSUPPORTED = set()      # params the server rejected once; not sent again
+
+
+def _headers():
+    h = {"Content-Type": "application/json"}
+    if API_KEY:
+        k = API_KEY.strip()
+        if k.lower().startswith("bearer "):
+            k = k[7:].strip()
+        h["Authorization"] = f"Bearer {k}"
+    return h
+
+
+def call_api(api_url, model, messages, extra_body=None):
+    """POST with timeout + exponential backoff. Returns (content, finish_reason)."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "seed": SEED,
+        "stream": False,
+    }
+    if extra_body:
+        payload.update(extra_body)
+    for k in _UNSUPPORTED:
+        payload.pop(k, None)
+
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.post(api_url, headers=_headers(), json=payload, timeout=REQUEST_TIMEOUT)
+            if r.status_code in (408, 429) or r.status_code >= 500:
+                raise RetryableError(f"HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code >= 400:
+                # Some servers reject unknown params (seed / chat_template_kwargs): drop and retry once.
+                for opt in ("chat_template_kwargs", "seed"):
+                    if opt in payload:
+                        payload.pop(opt)
+                        _UNSUPPORTED.add(opt)
+                        print(f"    server rejected '{opt}', retrying without it")
+                        break
+                else:
+                    r.raise_for_status()
+                continue
+            result = r.json()
+            choices = result.get("choices") or []
+            if not choices:
+                raise RetryableError(f"No choices in response: {str(result)[:200]}")
+            msg = choices[0].get("message") or {}
+            content = msg.get("content")
+            if content is None:
+                content = choices[0].get("text")   # plain completion schema only, never reasoning
+            return (content or "").strip(), choices[0].get("finish_reason")
+        except (requests.ConnectionError, requests.Timeout, RetryableError) as e:
+            last_err = e
+            wait = min(60, 2 ** attempt * 3) + random.uniform(0, 1)
+            print(f"    retry {attempt + 1}/{MAX_RETRIES} in {wait:.0f}s ({type(e).__name__}: {str(e)[:120]})")
+            time.sleep(wait)
+    raise RuntimeError(f"API failed after {MAX_RETRIES} attempts: {last_err}")
+
+
+# --------------------------------------------------------------------------
+# Post-processing / validation
+# --------------------------------------------------------------------------
+def clean_summary(text):
+    t = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)  # stray thinking blocks
+    t = re.sub(r"[*_#`>]+", "", t)                 # markdown
+    t = re.sub(r"^\s*[-•]\s*", "", t, flags=re.MULTILINE)
+    t = PREFACE_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip().strip('"').strip("'").strip()
+    if t and t[-1] not in ".!?":
+        t += "."
+    return t
+
+
+def validate(summary, finish_reason):
+    if not summary:
+        return "empty"
+    if finish_reason == "length":
+        return "truncated"
+    n_sent = len([s for s in re.split(r"(?<=[.!?])\s+", summary) if s.strip()])
+    n_words = len(summary.split())
+    if n_sent < MIN_SENTENCES or n_sent > MAX_SENTENCES:
+        return f"sentences={n_sent}"
+    if n_words > MAX_WORDS:
+        return f"words={n_words}"
+    return None
+
+
+def get_summary(text, previous_summary, api_url, model, extra_body):
+    context = CONTEXT_TEMPLATE.format(prev=previous_summary) if previous_summary else ""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": USER_TEMPLATE.format(context=context, text=text)},
+    ]
+    problem, summary = None, ""
+    for attempt in range(MAX_FORMAT_RETRIES + 1):
+        raw, finish = call_api(api_url, model, messages, extra_body)
+        summary = clean_summary(raw)
+        problem = validate(summary, finish)
+        if problem is None:
+            return summary, "ok", None, attempt
+        if attempt < MAX_FORMAT_RETRIES:
+            # remind the model of the format; temperature stays 0, so the extra turn changes the output
+            messages = messages[:2] + [
+                {"role": "assistant", "content": raw or "(empty)"},
+                {"role": "user", "content": f"That violates the rules ({problem}). "
+                                            f"Rewrite it as 2-3 sentences, at most 50 words, plain prose only."},
+            ]
+    return summary, "invalid", problem, MAX_FORMAT_RETRIES
+
+
+# --------------------------------------------------------------------------
+# Chunk-file processing (resumable JSONL)
+# --------------------------------------------------------------------------
+def _parse_time_str(t_str):
+    try:
+        parts = [float(p) for p in t_str.strip().replace(",", ".").split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 1:
+        return parts[0]
+    return None
+
+
+def _load_done(jsonl_path):
+    done = {}
+    if jsonl_path.exists():
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    done[rec["chunk_index"]] = rec
+                except (json.JSONDecodeError, KeyError):
+                    continue        # partial last line after a crash
+    return done
+
+
+def process_chunk_file(input_path, out_dir, args, extra_body):
+    print(f"\nProcessing: {input_path.name}")
+    with open(input_path, encoding="utf-8") as f:
+        chunks = json.load(f)
+    if not chunks or not any(k in chunks[0] for k in ("interval", "window_label", "preprocessed_input")):
+        print("  [ERROR] Not a chunk file. Run 02_json_chunk_extraction_03.py first.")
+        return
+
+    stem = re.sub(r"_chunk$", "", input_path.stem)
+    jsonl_path = out_dir / f"{stem}_output.jsonl"
+    json_path = out_dir / f"{stem}_output.json"
+    if args.overwrite:
+        for p in (jsonl_path, json_path):
+            if p.exists():
+                p.unlink()
+    done = _load_done(jsonl_path)
+    if args.retry_failed:
+        done = {k: v for k, v in done.items() if v.get("status") == "ok"}
+
+    previous_summary = None
+    counts = {"ok": 0, "invalid": 0, "error": 0, "skipped": 0, "cached": 0}
+    new_records = []
+
+    for i, c in enumerate(chunks):
+        source_text = c.get("preprocessed_input") or c.get("text") or c.get("source_text") or ""
+        label = c.get("interval") or c.get("window_label") or f"chunk_{i}"
+        start = c.get("start_sec", c.get("window_start_sec"))
+        end = c.get("end_sec", c.get("window_end_sec"))
+        if (start is None or end is None) and " - " in label:
+            a, b = label.split(" - ", 1)
+            start, end = _parse_time_str(a), _parse_time_str(b)
+
+        if i in done:
+            counts["cached"] += 1
+            if done[i].get("status") == "ok":
+                previous_summary = done[i]["reference_summary"]
+            continue
+        if not source_text.strip():
+            counts["skipped"] += 1
+            continue
+
+        ctx = previous_summary if args.context == "teacher" else None
+        rec = {
+            "chunk_index": i,
+            "window_label": label,
+            "window_start_sec": start,
+            "window_end_sec": end,
+            "source_text": source_text,
+            "previous_summary": ctx,
+            "reference_model": args.model,
+            "prompt_version": PROMPT_VERSION,
+            "gen_params": {"temperature": TEMPERATURE, "max_tokens": MAX_TOKENS, "seed": SEED},
+        }
+        try:
+            summary, status, problem, n_retry = get_summary(source_text, ctx, args.api_url, args.model, extra_body)
+            rec.update(reference_summary=summary if status == "ok" else "",
+                       rejected_output=summary if status != "ok" else None,
+                       status=status, problem=problem, format_retries=n_retry)
+            previous_summary = summary if status == "ok" else None
+            print(f"  [{label}] {status}: {summary[:90]}{'...' if len(summary) > 90 else ''}")
+        except Exception as e:
+            rec.update(reference_summary="", status="error", problem=f"{type(e).__name__}: {e}")
+            previous_summary = None
+            print(f"  [{label}] ERROR: {e}")
+        counts[rec["status"]] += 1
+
+        with open(jsonl_path, "a", encoding="utf-8") as f:   # append immediately: crash-safe
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        new_records.append(rec)
+
+    # Final JSON: only successful chunks, only interval / preprocessed_input / summary.
+    # (Full metadata incl. failures stays in the .jsonl log, used for resume / --retry_failed.)
+    merged = _load_done(jsonl_path)
+    final = [
+        {
+            "interval": merged[k]["window_label"],
+            "preprocessed_input": merged[k]["source_text"],
+            "summary": merged[k]["reference_summary"],
+        }
+        for k in sorted(merged) if merged[k].get("status") == "ok"
+    ]
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(final, f, indent=2, ensure_ascii=False)
+    n_bad = len(merged) - len(final)
+    print(f"  Saved {len(final)} summaries -> {json_path.name}"
+          f"{f'  ({n_bad} failed, see .jsonl; rerun with --retry_failed)' if n_bad else ''}  this run: {counts}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Generate teacher summaries for chunked subtitle JSON files.")
+    ap.add_argument("-i", "--input", dest="input_target", required=True,
+                    help="Chunk JSON file or folder of *_chunk.json files")
+    ap.add_argument("-o", "--output", dest="output_dir", required=True, help="Output folder")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Teacher model name on the server")
+    ap.add_argument("--api_url", default=DEFAULT_API_URL, help="OpenAI-compatible /chat/completions URL")
+    ap.add_argument("--context", choices=["none", "teacher"], default="none",
+                    help="none: summarize each chunk independently (recommended). "
+                         "teacher: condition on the teacher's previous summary")
+    ap.add_argument("--no_thinking_flag", action="store_true",
+                    help="Do not send chat_template_kwargs.enable_thinking=false")
+    ap.add_argument("-f", "--overwrite", action="store_true", help="Discard existing outputs and regenerate")
+    ap.add_argument("--retry_failed", action="store_true", help="Regenerate only chunks not marked ok")
+    args = ap.parse_args()
+
+    target, out_dir = Path(args.input_target), Path(args.output_dir)
+    if not target.exists():
+        print(f"[ERROR] Input '{target}' does not exist.")
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if target.is_file():
+        files = [target]
+    else:
+        files = sorted(target.glob("*_chunk.json"))
+    if not files:
+        print(f"[WARN] No *_chunk.json files found in '{target}'.")
+        return
+
+    extra_body = None if args.no_thinking_flag else {"chat_template_kwargs": {"enable_thinking": False}}
+    print(f"Model: {args.model} | context: {args.context} | prompt {PROMPT_VERSION} | {len(files)} files")
+    for fp in files:
+        process_chunk_file(fp, out_dir, args, extra_body)
+
+
+if __name__ == "__main__":
+    main()
