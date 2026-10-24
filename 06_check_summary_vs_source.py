@@ -18,20 +18,45 @@ rouge1_p / rouge2_p / rougeL_p
 novel_names    names in the summary that are NOT in the text (should be empty)
 words, sentences, compression
 
-Flags: low_faithfulness (<0.5), off_topic (sim < 0.3), novel_names, too_long (>50 words),
-       bad_sentence_count (not 2-3)
+LLM judge (optional, recommended)
+--------------------------------
+A DIFFERENT model (e.g. Qwen) reads the text + summary and answers: is every claim
+supported by the text (reasonable inferences allowed)? yes/no + the unsupported claim.
+NLI cannot make inferences ("Action! ... [laughter]" -> filming bloopers), the judge can.
+--judge_scope low  : judge only chunks with NLI faithfulness < 0.5 (default, cheaper)
+--judge_scope all  : judge every chunk
+Judge answers are cached in <out_dir>/judge_cache.jsonl (re-runs do not re-call the API).
+
+Flags
+-----
+novel_names, judge_unfaithful, too_long (>50 words), bad_sentence_count (not 2-3)  -> DROP
+low_nli (<0.5), off_topic (sim < 0.3)                                              -> info only
+
+Filtered training data (only kept chunks) is written to <out_dir>/filtered/<movie>_output.json
+with interval / preprocessed_input / summary.
 
 Example
 -------
-python 06_check_summary_vs_source.py -i ./summaries_gemma -o ./check_gemma
+python 06_check_summary_vs_source.py -i ./summaries_gemma -o ./check_gemma \
+    --judge_model <qwen-model-name> --judge_url http://<server>:4000/v1/chat/completions
 """
 
 import argparse
 import csv
+import hashlib
 import json
+import os
 import re
 import statistics as st
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from pathlib import Path
 
@@ -226,10 +251,109 @@ class Embed:
 
 
 # --------------------------------------------------------------------------
+# LLM judge
+# --------------------------------------------------------------------------
+JUDGE_SYSTEM = """You check whether a summary of movie subtitle dialogue is faithful to the dialogue.
+"Name:" at the start of a sentence is a speaker label; [music], [laughter], [crying] etc. are sound cues.
+
+A claim is SUPPORTED if it is stated in the dialogue OR is a reasonable inference from it
+(e.g. "a mother and her son" when one says "Mom"; "a film crew shoots a scene" when people say
+"Action!" and "keep rolling"). Paraphrasing and summarising are fine.
+A claim is UNSUPPORTED if it adds names, places, events, outcomes, motives or relationships
+that the dialogue does not state or clearly imply, or if it contradicts the dialogue.
+
+Reply with ONLY a JSON object:
+{"faithful": "yes" or "no", "unsupported": "<the unsupported claim, or empty>", "reason": "<max 15 words>"}"""
+
+
+_NO_THINK_FLAG = {"supported": True}     # set False once the server rejects chat_template_kwargs
+
+
+def _judge_call(url, model, key, text, summary, timeout=180):
+    import requests
+    headers = {"Content-Type": "application/json"}
+    if key:
+        k = key.strip()
+        if k.lower().startswith("bearer "):
+            k = k[7:].strip()
+        headers["Authorization"] = f"Bearer {k}"
+    user = f"Dialogue:\n{text}\n\nSummary:\n{summary}"
+    if "qwen" in model.lower():
+        user += "\n/no_think"          # Qwen3 soft switch: skip the slow reasoning phase
+    payload = {"model": model, "temperature": 0, "max_tokens": 120, "stream": False,
+               "messages": [{"role": "system", "content": JUDGE_SYSTEM},
+                            {"role": "user", "content": user}]}
+    if _NO_THINK_FLAG["supported"]:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    last = None
+    for attempt in range(5):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 400 and "chat_template_kwargs" in payload:
+                payload.pop("chat_template_kwargs")          # server does not support it
+                _NO_THINK_FLAG["supported"] = False
+                continue
+            if r.status_code in (408, 429) or r.status_code >= 500:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            content = (r.json()["choices"][0]["message"].get("content") or "")
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+            m = re.search(r"\{.*\}", content, re.S)
+            res = json.loads(m.group(0)) if m else {}
+            verdict = str(res.get("faithful", "")).strip().lower()
+            if verdict in ("yes", "no"):
+                return {"faithful": verdict, "unsupported": str(res.get("unsupported", "")),
+                        "reason": str(res.get("reason", ""))}
+            raise ValueError(f"unparseable: {content[:100]}")
+        except Exception as e:
+            last = e
+            time.sleep(3 * 2 ** attempt)
+    return {"faithful": "error", "unsupported": "", "reason": str(last)[:150]}
+
+
+class Judge:
+    def __init__(self, url, model, key, cache_path):
+        self.url, self.model, self.key, self.cache_path = url, model, key, cache_path
+        self.cache = {}
+        if cache_path.exists():
+            for line in open(cache_path, encoding="utf-8"):
+                try:
+                    d = json.loads(line)
+                    self.cache[d["key"]] = d["result"]
+                except Exception:
+                    pass
+
+    def _key(self, text, summary):
+        return hashlib.sha1(f"{self.model}\n{text}\n{summary}".encode("utf-8")).hexdigest()
+
+    def run(self, items, workers=4):
+        """items: list of (text, summary). Returns list of result dicts."""
+        todo = [(i, t, s) for i, (t, s) in enumerate(items) if self._key(t, s) not in self.cache]
+        print(f"Judge {self.model}: {len(items)} chunks ({len(items) - len(todo)} cached, {len(todo)} to call)")
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex, \
+                open(self.cache_path, "a", encoding="utf-8") as f:
+            futs = {ex.submit(_judge_call, self.url, self.model, self.key, t, s): (i, t, s)
+                    for i, t, s in todo}
+            for fut in futs:
+                i, t, s = futs[fut]
+                res = fut.result()
+                k = self._key(t, s)
+                if res["faithful"] != "error":
+                    f.write(json.dumps({"key": k, "result": res}, ensure_ascii=False) + "\n")
+                    f.flush()
+                self.cache[k] = res
+                done += 1
+                if done % 25 == 0:
+                    print(f"  judged {done}/{len(todo)}")
+        return [self.cache[self._key(t, s)] for t, s in items]
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-
 FAITH_MIN, SIM_MIN, MAX_WORDS, SENT_RANGE = 0.5, 0.3, 50, (2, 3)
+DROP_FLAGS = ("novel_names", "judge_unfaithful", "too_long", "bad_sentence_count")
 
 
 def main():
@@ -238,6 +362,13 @@ def main():
     ap.add_argument("-o", "--out_dir", default="./summary_check")
     ap.add_argument("--nli_model", default="cross-encoder/nli-deberta-v3-base", help="'' to skip")
     ap.add_argument("--embed_model", default="sentence-transformers/all-MiniLM-L6-v2", help="'' to skip")
+    ap.add_argument("--judge_model", default="", help="Judge model, e.g. Qwen ('' = no judge)")
+    ap.add_argument("--judge_url", default=os.getenv("JUDGE_API_URL", ""),
+                    help="OpenAI-compatible /chat/completions URL")
+    ap.add_argument("--judge_key_env", default="GEMMA_API_KEY", help="Env var with the judge API key")
+    ap.add_argument("--judge_scope", choices=["low", "all"], default="low",
+                    help="low: only chunks with NLI < 0.5 (or all if NLI unavailable); all: every chunk")
+    ap.add_argument("--workers", type=int, default=4, help="Parallel judge requests")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -247,6 +378,8 @@ def main():
     if not data:
         print("No summaries loaded. Check the folder path.")
         return
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
     nli = emb = None
     if args.nli_model:
@@ -260,11 +393,12 @@ def main():
         except Exception as e:
             print(f"[WARN] semantic similarity skipped: {e}")
 
+    # ---- automatic metrics
     rows = []
     for i, (movie, label, src, s) in enumerate(sorted(data.values(), key=lambda v: (v[0], v[1]))):
         names = novel_names(s, src)
         nw, ns = len(s.split()), len(sentences(s))
-        r = {
+        rows.append({
             "movie": movie, "interval": label,
             "faithfulness": round(nli.score(src, s), 4) if nli else None,
             "semantic_sim": round(emb.sim(s, src), 4) if emb else None,
@@ -274,66 +408,120 @@ def main():
             "novel_names": ", ".join(names),
             "words": nw, "sentences": ns,
             "compression": round(nw / max(1, len(src.split())), 4),
-        }
-        flags = []
-        if r["faithfulness"] is not None and r["faithfulness"] < FAITH_MIN:
-            flags.append("low_faithfulness")
-        if r["semantic_sim"] is not None and r["semantic_sim"] < SIM_MIN:
-            flags.append("off_topic")
-        if names:
-            flags.append("novel_names")
-        if nw > MAX_WORDS:
-            flags.append("too_long")
-        if not SENT_RANGE[0] <= ns <= SENT_RANGE[1]:
-            flags.append("bad_sentence_count")
-        r["flags"] = ";".join(flags)
-        r["summary"] = s
-        r["preprocessed_input"] = src
-        rows.append(r)
+            "judge_faithful": "", "judge_unsupported": "", "judge_reason": "",
+            "summary": s, "preprocessed_input": src,
+        })
         if (i + 1) % 50 == 0:
             print(f"  scored {i + 1}/{len(data)}")
 
-    # worst first: most flags, then lowest faithfulness / rougeL precision
-    def badness(r):
-        f = r["faithfulness"] if r["faithfulness"] is not None else r["rougeL_p"]
-        return (-len([x for x in r["flags"].split(";") if x]), f)
-    rows.sort(key=badness)
+    # ---- LLM judge
+    judged = 0
+    if args.judge_model:
+        if not args.judge_url:
+            print("[WARN] --judge_model given without --judge_url: judge skipped.")
+        else:
+            sel = [r for r in rows if args.judge_scope == "all" or r["faithfulness"] is None
+                   or r["faithfulness"] < FAITH_MIN]
+            judge = Judge(args.judge_url, args.judge_model, os.getenv(args.judge_key_env, ""),
+                          out / "judge_cache.jsonl")
+            results = judge.run([(r["preprocessed_input"], r["summary"]) for r in sel], args.workers)
+            for r, res in zip(sel, results):
+                r["judge_faithful"], r["judge_unsupported"], r["judge_reason"] = \
+                    res["faithful"], res["unsupported"], res["reason"]
+            judged = len(sel)
 
-    out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    # ---- flags / keep
+    for r in rows:
+        flags = []
+        if r["novel_names"]:
+            flags.append("novel_names")
+        if r["judge_faithful"] == "no":
+            flags.append("judge_unfaithful")
+        if r["words"] > MAX_WORDS:
+            flags.append("too_long")
+        if not SENT_RANGE[0] <= r["sentences"] <= SENT_RANGE[1]:
+            flags.append("bad_sentence_count")
+        if r["faithfulness"] is not None and r["faithfulness"] < FAITH_MIN:
+            flags.append("low_nli")
+        if r["semantic_sim"] is not None and r["semantic_sim"] < SIM_MIN:
+            flags.append("off_topic")
+        r["flags"] = ";".join(flags)
+        r["keep"] = "no" if any(f in DROP_FLAGS for f in flags) else "yes"
+
+    # worst first: dropped first, then most flags, then lowest NLI
+    rows.sort(key=lambda r: (r["keep"] == "yes", -len([x for x in r["flags"].split(";") if x]),
+                             r["faithfulness"] if r["faithfulness"] is not None else r["rougeL_p"]))
+    cols = ["movie", "interval", "keep", "flags", "judge_faithful", "judge_unsupported", "judge_reason",
+            "faithfulness", "semantic_sim", "rouge1_p", "rouge2_p", "rougeL_p", "novel_names",
+            "words", "sentences", "compression", "summary", "preprocessed_input"]
     with open(out / "summary_check.csv", "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
 
+    # ---- filtered training data
+    fdir = out / "filtered"
+    fdir.mkdir(exist_ok=True)
+    by_movie = {}
+    for r in rows:
+        if r["keep"] == "yes":
+            by_movie.setdefault(r["movie"], []).append(r)
+    for movie, rs in by_movie.items():
+        rs.sort(key=lambda r: data_order(r["interval"]))
+        with open(fdir / f"{movie}_output.json", "w", encoding="utf-8") as f:
+            json.dump([{"interval": r["interval"], "preprocessed_input": r["preprocessed_input"],
+                        "summary": r["summary"]} for r in rs], f, indent=2, ensure_ascii=False)
+
+    # ---- report
     def avg(k):
         v = [r[k] for r in rows if r[k] is not None]
         return f"{st.mean(v):.3f}" if v else "-"
 
     n = len(rows)
-    flag_names = ["low_faithfulness", "off_topic", "novel_names", "too_long", "bad_sentence_count"]
-    clean = sum(1 for r in rows if not r["flags"])
+    kept = sum(r["keep"] == "yes" for r in rows)
     L = [f"# Summary vs preprocessed text — {inp.name}", "", f"Chunks: {n}", "",
          "| Metric | Average |", "|---|---|"]
-    for k, lab in [("faithfulness", "NLI faithfulness (higher better)"),
-                   ("semantic_sim", "Semantic similarity (higher better)"),
+    for k, lab in [("faithfulness", "NLI faithfulness (strict, info only)"),
+                   ("semantic_sim", "Semantic similarity"),
                    ("rouge1_p", "ROUGE-1 precision vs text"), ("rouge2_p", "ROUGE-2 precision vs text"),
                    ("rougeL_p", "ROUGE-L precision vs text"), ("words", "Words per summary"),
                    ("sentences", "Sentences per summary"), ("compression", "Compression (summary/text words)")]:
         if avg(k) != "-":
             L.append(f"| {lab} | {avg(k)} |")
-    L += ["", "| Flag | Chunks | % |", "|---|---|---|"]
-    for fl in flag_names:
+    if judged:
+        yes = sum(r["judge_faithful"] == "yes" for r in rows)
+        no = sum(r["judge_faithful"] == "no" for r in rows)
+        err = sum(r["judge_faithful"] == "error" for r in rows)
+        L += ["", f"## LLM judge ({args.judge_model}, scope: {args.judge_scope}, {judged} chunks judged)", "",
+              f"- faithful: **{yes}** ({100 * yes / judged:.1f}%)",
+              f"- NOT faithful: **{no}** ({100 * no / judged:.1f}%)  -> dropped",
+              f"- judge errors: {err}" + ("  (re-run to retry; successful answers are cached)" if err else "")]
+    L += ["", "| Flag | Chunks | % | Action |", "|---|---|---|---|"]
+    for fl in ["novel_names", "judge_unfaithful", "too_long", "bad_sentence_count", "low_nli", "off_topic"]:
         c = sum(fl in r["flags"].split(";") for r in rows)
-        L.append(f"| {fl} | {c} | {100 * c / n:.1f}% |")
-    L += ["", f"**Clean summaries (no flag): {clean}/{n} ({100 * clean / n:.1f}%)**", "",
-          "## 10 worst chunks", ""]
+        L.append(f"| {fl} | {c} | {100 * c / n:.1f}% | {'drop' if fl in DROP_FLAGS else 'info'} |")
+    L += ["", f"**Kept for training: {kept}/{n} ({100 * kept / n:.1f}%)** -> {fdir}", "",
+          "## Worst chunks (dropped first, top 10)", ""]
     for r in rows[:10]:
         L.append(f"- **{r['movie']} {r['interval']}** [{r['flags'] or 'no flag'}] "
-                 f"faith={r['faithfulness']} names={r['novel_names'] or '-'}  \n  {r['summary']}")
+                 f"judge={r['judge_faithful'] or '-'} {('— ' + r['judge_unsupported']) if r['judge_unsupported'] else ''}  \n"
+                 f"  {r['summary']}")
     report = "\n".join(L)
     (out / "summary_check.md").write_text(report, encoding="utf-8")
     print("\n" + report + f"\n\nFiles: {out.resolve()}")
+
+
+def data_order(interval):
+    """Sort key for 'mm:ss - mm:ss' / 'hh:mm:ss - ...' intervals."""
+    try:
+        start = interval.split(" - ")[0]
+        parts = [float(p) for p in start.replace(",", ".").split(":")]
+        sec = 0.0
+        for p in parts:
+            sec = sec * 60 + p
+        return sec
+    except Exception:
+        return 0.0
 
 
 if __name__ == "__main__":
