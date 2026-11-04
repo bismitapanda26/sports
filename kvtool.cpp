@@ -91,6 +91,22 @@ static Model load(const char * path) {
     llama_backend_init();
     Model m;
     llama_model_params mp = llama_model_default_params();
+    // Model loading: match your TV app. KVTOOL_MMAP=0 reads the model fully into RAM
+    // (no re-reading from flash under memory pressure). KVTOOL_MLOCK=1 pins it in RAM.
+#ifdef KVTOOL_FA_BOOL   // older llama.cpp (your TV): bool use_mmap / use_mlock
+    if (getenv("KVTOOL_MMAP"))  mp.use_mmap  = atoi(getenv("KVTOOL_MMAP"))  != 0;
+    if (getenv("KVTOOL_MLOCK")) mp.use_mlock = atoi(getenv("KVTOOL_MLOCK")) != 0;
+    printf("      use_mmap=%d use_mlock=%d\n", (int) mp.use_mmap, (int) mp.use_mlock);
+#else                   // newer llama.cpp: load_mode enum
+    {
+        const bool mm = getenv("KVTOOL_MMAP")  ? atoi(getenv("KVTOOL_MMAP"))  != 0 : true;
+        const bool ml = getenv("KVTOOL_MLOCK") ? atoi(getenv("KVTOOL_MLOCK")) != 0 : false;
+        if (getenv("KVTOOL_MMAP") || getenv("KVTOOL_MLOCK"))
+            mp.load_mode = mm ? (ml ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP)
+                              : (ml ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE);
+        printf("      load_mode=%d\n", (int) mp.load_mode);
+    }
+#endif
     m.model = llama_model_load_from_file(path, mp);
     if (!m.model) die("failed to load model");
     printf("[2/4] creating context...\n");
